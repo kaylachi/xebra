@@ -6,6 +6,7 @@ import {
   ARC_GAS_RESERVE_UNITS,
   type EvmBridgeRequest,
   type EvmBridgeStep,
+  EvmBurnUncertainError,
   getUsdcBalance6,
   spendableUsdc,
   submitEvmBridge,
@@ -34,6 +35,7 @@ function chain(
     chainId: number;
     balance: bigint;
     allowance: bigint;
+    nonce: bigint;
     /** What an approval actually sets, when the user lowers it in the wallet. */
     approvalSets: bigint;
     approvalStatus: string;
@@ -41,12 +43,14 @@ function chain(
     chainAfterApproval: number;
     simulation: () => string;
     emptyReads: boolean;
+    onBurnSend: (state: { nonce: bigint }) => unknown;
   }> = {},
 ) {
   const state = {
     chainId: base.chainId,
     balance: 100_000_000n,
     allowance: 0n,
+    nonce: 0n,
     approvalStatus: "0x1",
     simulation: () => "0x",
     ...over,
@@ -70,12 +74,17 @@ function chain(
           if (selector === "0x779b432d" || selector === "0x132519fe") return state.simulation();
           throw new Error(`unexpected eth_call ${selector}`);
         }
+        case "eth_getTransactionCount":
+          return `0x${state.nonce.toString(16)}`;
         case "eth_sendTransaction": {
           sent.push(arg as never);
           if (arg?.data?.startsWith("0x095ea7b3")) {
             state.allowance = state.approvalSets ?? BigInt(`0x${arg.data.slice(-64)}`);
             if (state.chainAfterApproval) state.chainId = state.chainAfterApproval;
             return APPROVAL_HASH;
+          }
+          if (over.onBurnSend) {
+            return over.onBurnSend(state);
           }
           return BURN_HASH;
         }
@@ -375,5 +384,73 @@ describe("getUsdcBalance6", () => {
     const c = chain({ balance: 42_000_000n });
     expect(await getUsdcBalance6(c.provider, base, FROM)).toBe(42_000_000n);
     expect(c.calls[0]?.params?.[0]).toMatchObject({ to: base.usdcAddress });
+  });
+});
+
+describe("submitEvmBridge", () => {
+  it("reports uncertain burn when sendTransaction throws and pending nonce moved", async () => {
+    const c = chain({
+      allowance: 5_000_000n,
+      nonce: 4n,
+      onBurnSend: (state) => {
+        state.nonce = 5n;
+        throw new Error("WalletConnect relay dropped");
+      },
+    });
+
+    let caught: unknown;
+    try {
+      await submitEvmBridge(request(c, { nonceCheck: { attempts: 3, intervalMs: 1 } }));
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).toBeInstanceOf(EvmBurnUncertainError);
+    expect((caught as Error).message).toMatch(/may have been sent/i);
+    expect((caught as Error).message).toMatch(/check your wallet's activity before trying again/i);
+    expect((caught as Error).message).not.toMatch(/nothing was burned/i);
+    expect(c.calls.filter((x) => x.method === "eth_getTransactionCount")).toHaveLength(2);
+  });
+
+  it("rethrows the send error without uncertain warning when pending nonce stays unchanged", async () => {
+    const c = chain({
+      allowance: 5_000_000n,
+      nonce: 4n,
+      onBurnSend: () => {
+        throw new Error("relay timeout before broadcast");
+      },
+    });
+
+    let caught: unknown;
+    try {
+      await submitEvmBridge(request(c, { nonceCheck: { attempts: 3, intervalMs: 1 } }));
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).not.toBeInstanceOf(EvmBurnUncertainError);
+    expect((caught as Error).message).toBe("relay timeout before broadcast");
+    expect(c.calls.filter((x) => x.method === "eth_getTransactionCount")).toHaveLength(4);
+  });
+
+  it("stops immediately without polling nonce on a 4001 user decline", async () => {
+    const c = chain({
+      allowance: 5_000_000n,
+      nonce: 4n,
+      onBurnSend: () => {
+        throw { code: 4001, message: "User rejected the request." };
+      },
+    });
+
+    let caught: unknown;
+    try {
+      await submitEvmBridge(request(c, { nonceCheck: { attempts: 3, intervalMs: 1 } }));
+    } catch (err) {
+      caught = err;
+    }
+
+    expect(caught).not.toBeInstanceOf(EvmBurnUncertainError);
+    expect((caught as Error).message).toBe("You declined the request in your wallet.");
+    expect(c.calls.filter((x) => x.method === "eth_getTransactionCount")).toHaveLength(1);
   });
 });

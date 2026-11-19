@@ -15,6 +15,7 @@ import {
   readChainId,
   sendTransaction,
   waitForReceipt,
+  walletErrorCode,
 } from "./evm-rpc";
 import { formatError } from "./format-error";
 import type { Eip1193Provider } from "./wallets/types";
@@ -58,6 +59,53 @@ export const EVM_STEP_LABEL: Record<EvmBridgeStep, (source: string) => string> =
 /** Long enough for a transaction priced low on a busy chain; the node is the wallet's, not ours. */
 const RECEIPT_TIMEOUT_MS = 10 * 60_000;
 const RECEIPT_POLL_MS = 2_000;
+const NONCE_POLL_ATTEMPTS = 5;
+const NONCE_POLL_INTERVAL_MS = 3_000;
+
+/**
+ * Thrown when `eth_sendTransaction` fails and pending-nonce checks show (or cannot rule out)
+ * that the wallet broadcast the burn before dropping the connection.
+ */
+export class EvmBurnUncertainError extends Error {
+  readonly mayHaveSent = true;
+
+  constructor(message: string, cause?: unknown) {
+    super(message, { cause });
+    this.name = "EvmBurnUncertainError";
+  }
+}
+
+function errorCodeChain(err: unknown): number | null {
+  const direct = walletErrorCode(err);
+  if (direct !== null) return direct;
+  if (err instanceof Error && err.cause !== undefined) {
+    return walletErrorCode(err.cause);
+  }
+  return null;
+}
+
+function isClearDecline(err: unknown): boolean {
+  const code = errorCodeChain(err);
+  return code === 4001 || code === 4100;
+}
+
+async function readPendingNonce(provider: Eip1193Provider, from: string): Promise<bigint | null> {
+  try {
+    const raw = await provider.request({
+      method: "eth_getTransactionCount",
+      params: [from, "pending"],
+    });
+    if (typeof raw === "string" && /^0x[0-9a-fA-F]+$/.test(raw)) {
+      return BigInt(raw);
+    }
+    if (typeof raw === "number" && Number.isSafeInteger(raw) && raw >= 0) {
+      return BigInt(raw);
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
 
 /**
  * Arc pays gas in the same USDC it is asked to burn. A transfer of the whole balance leaves
@@ -119,6 +167,8 @@ export interface EvmBridgeRequest {
    * fee included). Absent: call Circle directly.
    */
   via?: { address: string; maxWrapperFee: bigint } | null;
+  /** Optional polling overrides used in tests for the post-error pending-nonce check. */
+  nonceCheck?: { attempts?: number; intervalMs?: number };
 }
 
 /** How long a request through the wrapper stays good, from the chain's latest block. */
@@ -223,12 +273,43 @@ export async function submitEvmBridge(req: EvmBridgeRequest): Promise<EvmBridgeR
   }
 
   step("burning");
-  const txHash = await sendTransaction(provider, {
-    from,
-    to: target,
-    data: burn,
-    chainId: source.chainId,
-  });
+  const nonceBefore = await readPendingNonce(provider, from);
+  let txHash: Hex;
+  try {
+    txHash = await sendTransaction(provider, {
+      from,
+      to: target,
+      data: burn,
+      chainId: source.chainId,
+    });
+  } catch (err) {
+    if (isClearDecline(err)) throw err;
+    const attempts = Math.max(1, req.nonceCheck?.attempts ?? NONCE_POLL_ATTEMPTS);
+    const intervalMs = Math.max(0, req.nonceCheck?.intervalMs ?? NONCE_POLL_INTERVAL_MS);
+    let sawSameNonce = false;
+    if (nonceBefore !== null) {
+      for (let i = 0; i < attempts; i++) {
+        const nonceAfter = await readPendingNonce(provider, from);
+        if (nonceAfter !== null) {
+          if (nonceAfter > nonceBefore) {
+            throw new EvmBurnUncertainError(
+              "Your burn transaction may have been sent before the wallet connection failed. Check your wallet's activity before trying again.",
+              err,
+            );
+          }
+          sawSameNonce = true;
+        }
+        if (i + 1 < attempts && intervalMs > 0) {
+          await new Promise((r) => setTimeout(r, intervalMs));
+        }
+      }
+      if (sawSameNonce) throw err;
+    }
+    throw new EvmBurnUncertainError(
+      "Your burn transaction may have been sent — the wallet failed and its pending nonce could not be verified. Check your wallet's activity before trying again.",
+      err,
+    );
+  }
   return { txHash, approvalTxHash };
 }
 

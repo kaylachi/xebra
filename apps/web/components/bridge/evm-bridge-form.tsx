@@ -28,6 +28,7 @@ import { env } from "../../lib/env";
 import {
   ARC_GAS_RESERVE_UNITS,
   EVM_STEP_LABEL,
+  EvmBurnUncertainError,
   getUsdcBalance6,
   spendableUsdc,
   submitEvmBridge,
@@ -587,7 +588,15 @@ export function EvmBridgeForm({
         })
         .catch(() => undefined);
     } catch (err) {
-      const classified = classifyWalletError(err);
+      const classified: ClassifiedError =
+        err instanceof EvmBurnUncertainError
+          ? {
+              kind: "network",
+              message: err.message,
+              maybeSent: true,
+              raw: formatError(err.cause ?? err),
+            }
+          : classifyWalletError(err);
       reportError("transfer failed", classified.raw);
       setSubmitError(classified);
     } finally {
