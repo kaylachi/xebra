@@ -101,7 +101,8 @@ export async function quoteBridge(
    *  *is* the price, so the price cannot be quoted without it. */
   maxFee: bigint,
 ): Promise<BridgeQuote> {
-  if (!config.wrapperContractId) throw new Error("The bridge contract is not configured.");
+  if (!config.wrapperContractId)
+    throw new BridgeSubmitError("The bridge contract is not configured.");
 
   const server = new rpc.Server(config.sorobanRpcUrl);
   const contract = new Contract(config.wrapperContractId);
@@ -125,9 +126,9 @@ export async function quoteBridge(
 
   const sim = await server.simulateTransaction(tx);
   if (rpc.Api.isSimulationError(sim)) {
-    throw new Error(humanizeContractError(sim.error, config.wrapperContractId));
+    throw new BridgeSubmitError(humanizeContractError(sim.error, config.wrapperContractId));
   }
-  if (!sim.result) throw new Error("The bridge did not return a quote.");
+  if (!sim.result) throw new BridgeSubmitError("The bridge did not return a quote.");
 
   const raw = scValToNative(sim.result.retval) as {
     amount: bigint;
@@ -380,10 +381,12 @@ export class UncertainSubmitError extends Error {
 }
 
 /**
- * An error `submitBridge` / `submitSigned` raise themselves: a humanized contract error, the raw
- * Soroban fallback with its diagnostic event log, or a rejected-transaction explanation. Its
- * message is already the answer to show, so `classifyStellarSubmitError` passes it through
- * unchanged instead of matching words like "denied" or "cancelled" in it. Nothing was sent.
+ * An error `quoteBridge` / `submitBridge` / `submitSigned` raise themselves: a humanized contract
+ * error, the raw Soroban fallback with its diagnostic event log, a missing quote, or a
+ * rejected-transaction explanation. Its message is already the answer to show, so
+ * `classifyStellarSubmitError` passes it through unchanged instead of matching words like "denied"
+ * or "cancelled" in it. Nothing was sent. (`quoteBridge` is included because the form re-quotes
+ * inside the same `try` as the submit.)
  */
 export class BridgeSubmitError extends Error {
   constructor(message: string) {
@@ -699,9 +702,9 @@ export function humanizeContractError(raw: string, wrapperContractId?: string | 
  * Classifies errors caught during Stellar burn submission:
  * - `UncertainSubmitError` keeps its message (including the tx hash) with `maybeSent: true` so the
  *   UI never claims "No funds have moved" or hides the hash.
- * - `BridgeSubmitError`, the app's own answers from `submitBridge` / `submitSigned` (humanized
- *   contract errors, the raw Soroban fallback, rejected-transaction explanations), passes through
- *   unchanged with `maybeSent: false`. Its text is never matched, so a diagnostic log containing
+ * - `BridgeSubmitError`, the app's own answers from `quoteBridge` / `submitBridge` /
+ *   `submitSigned` (humanized contract errors, the raw Soroban fallback, a missing quote,
+ *   rejected-transaction explanations), passes through unchanged with `maybeSent: false`. Its text is never matched, so a diagnostic log containing
  *   "denied" or "cancelled" stays an alarm with its full event log, and rewording a message cannot
  *   quietly change how it is classified.
  * - Everything else is a wallet or transport error and goes to `classifyWalletError`.
